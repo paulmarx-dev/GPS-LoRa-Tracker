@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GPS Track Viewer</title>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { display: flex; flex-direction: column; }
+    #topbar {
+      display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;
+      padding: 10px 12px; border-bottom: 1px solid #ddd; background: #fafafa;
+      flex: 0 0 auto;
+    }
+    #topbar.collapsed { padding: 6px 12px; }
+    #topbar.collapsed .field { display: none; }
+    #topbar.collapsed .topbar-toggle { display: inline-flex; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    label { font-size: 12px; color: #333; }
+    input, button {
+      font-size: 14px; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; background: #fff;
+    }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
+    #status { padding: 6px 12px; font-size: 13px; color: #333; flex: 0 0 auto; }
+    #map { flex: 1 1 auto; min-height: 240px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+    /* checkbox row */
+    .checks { display: flex; gap: 10px; align-items: center; padding-bottom: 2px; }
+    .checks label { font-size: 13px; display: flex; align-items: center; gap: 6px; margin: 0; }
+    .checks input[type="checkbox"] { width: 16px; height: 16px; padding: 0; }
+
+    .topbar-toggle {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      padding: 6px 0;
+      border-radius: 999px;
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    @media (max-width: 720px) {
+      .topbar-toggle { display: inline-flex; }
+    }
+  </style>
+</head>
+<body>
+  <div id="topbar">
+    <button id="topbarToggle" class="topbar-toggle" aria-expanded="true" aria-label="Collapse controls">▾</button>
+    <div class="field">
+      <label for="device">Device</label>
+      <input id="device" value="ESP32-GPS-001" />
+    </div>
+
+    <div class="field">
+      <label for="start">Start (local time)</label>
+      <input id="start" type="datetime-local" />
+    </div>
+
+    <div class="field">
+      <label for="end">End (local time)</label>
+      <input id="end" type="datetime-local" />
+    </div>
+
+    <div class="field">
+      <label>Options</label>
+      <div class="checks">
+        <label><input id="showPoints" type="checkbox"> Show points</label>
+        <label><input id="colorByCh" type="checkbox" checked> Color by channel</label>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>&nbsp;</label>
+      <button id="loadBtn">Load track</button>
+    </div>
+
+    <div class="field">
+      <label>&nbsp;</label>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+
+    <div class="field">
+      <label>&nbsp;</label>
+      <button id="last24Btn">Last 24h</button>
+    </div>
+
+    <div class="field">
+      <label>&nbsp;</label>
+      <button id="last1hBtn">Last 1h</button>
+    </div>
+
+    <div class="field">
+      <label>&nbsp;</label>
+      <button id="last15Btn">Last 15m</button>
+    </div>
+  </div>    
+
+  <div id="status" class="mono">Initializing…</div>
+  <div id="map"></div>
+
+  <script
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCLHu9NLUvCXyrAvhFQY6ZN8ybrGAK5u84&v=weekly"
+    defer
+  ></script>
+
+  <script>
+    // ===================== CONFIG =====================
+    const GPS_GEOJSON_URL = "./gps_geojson.php";            // adjust if needed
+    const API_TOKEN = "CHANGE_ME_LONG_RANDOM_TOKEN";        // must match PHP if enabled
+    // ==================================================
+
+    let map;
+
+    // lines
+    let singleLine = null;
+    let wifiLine = null;
+    let loraLine = null;
+
+    // markers (points)
+    let pointMarkers = [];
+
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg;
+    }
+
+    function toDatetimeLocalValue(d) {
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function parseDatetimeLocalToEpochSeconds(value) {
+      const d = new Date(value); // local time
+      if (Number.isNaN(d.getTime())) return null;
+      return Math.floor(d.getTime() / 1000);
+    }
+
+    function computeBounds(path) {
+      const bounds = new google.maps.LatLngBounds();
+      for (const p of path) bounds.extend(p);
+      return bounds;
+    }
+
+    function clearAllRender() {
+      if (singleLine) { singleLine.setMap(null); singleLine = null; }
+      if (wifiLine) { wifiLine.setMap(null); wifiLine = null; }
+      if (loraLine) { loraLine.setMap(null); loraLine = null; }
+
+      for (const m of pointMarkers) m.setMap(null);
+      pointMarkers = [];
+    }
+
+    async function fetchGeoJSON({ device, beginTs, endTs, wantPoints }) {
+      const url = new URL(GPS_GEOJSON_URL, window.location.href);
+      url.searchParams.set("device", device);
+      url.searchParams.set("begin_ts", String(beginTs));
+      url.searchParams.set("end_ts", String(endTs));
+      if (wantPoints) url.searchParams.set("points", "1");
+      // Aggressive cache-busting: timestamp + random
+      url.searchParams.set("_t", String(Date.now()));
+      url.searchParams.set("r", Math.random().toString(36).slice(2));
+
+      const res = await fetch(url.toString(), {
+        headers: {
+          "X-API-Token": API_TOKEN,
+          "X-Device-Id": device,
+          "Pragma": "no-cache",
+          "Cache-Control": "no-cache, no-store, must-revalidate"
+        },
+        cache: "no-store"  // Fetch-level cache control
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}: ${text}`);
+      }
+      return await res.json();
+    }
+
+    function extractLineString(geojson) {
+      // reads the first feature only (your php puts the LineString first)
+      if (!geojson || !Array.isArray(geojson.features) || geojson.features.length === 0) return [];
+      const f0 = geojson.features[0];
+      if (!f0 || !f0.geometry) return [];
+
+      if (f0.geometry.type === "LineString") {
+        const coords = f0.geometry.coordinates || [];
+        return coords.map(([lon, lat]) => ({ lat, lng: lon }));
+      }
+      if (f0.geometry.type === "Point") {
+        const [lon, lat] = f0.geometry.coordinates || [];
+        if (typeof lat === "number" && typeof lon === "number") return [{ lat, lng: lon }];
+      }
+      return [];
+    }
+
+    function extractPointFeatures(geojson) {
+      // returns array of {lat,lng,ts,ch,seq,bat,flags,net,speed_mps,speed_kmh}
+      const pts = [];
+      if (!geojson || !Array.isArray(geojson.features)) return pts;
+
+      for (const f of geojson.features) {
+        if (f?.geometry?.type !== "Point") continue;
+        const c = f.geometry.coordinates;
+        if (!Array.isArray(c) || c.length < 2) continue;
+
+        const lon = Number(c[0]);
+        const lat = Number(c[1]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+        const ts = Number(f.properties?.ts ?? 0);
+        const ch = String(f.properties?.ch ?? "").toLowerCase();
+        const seq = Number(f.properties?.seq ?? 0);
+        const bat = f.properties?.bat;
+        const flags = f.properties?.flags;
+        const net = f.properties?.net ?? "";
+        const speed_mps = f.properties?.speed_mps;
+        const speed_kmh = f.properties?.speed_kmh;
+
+        pts.push({ lat, lng: lon, ts, ch, seq, bat, flags, net, speed_mps, speed_kmh });
+      }
+
+      // sort by time/seq so paths are drawn correctly
+      pts.sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq));
+      return pts;
+    }
+
+    function drawMarkers(pts) {
+      // simple markers; for thousands of points you’ll want clustering      console.log("drawMarkers called with", pts.length, "points");
+      let created = 0;      for (const p of pts) {
+        const dt = p.ts ? new Date(p.ts * 1000).toISOString() : "";
+        let localDt = "";
+        if (p.ts) {
+          const localDate = new Date(p.ts * 1000);
+          const day = String(localDate.getDate()).padStart(2, "0");
+          const month = String(localDate.getMonth() + 1).padStart(2, "0");
+          const year = localDate.getFullYear();
+          const hours = String(localDate.getHours()).padStart(2, "0");
+          const minutes = String(localDate.getMinutes()).padStart(2, "0");
+          const seconds = String(localDate.getSeconds()).padStart(2, "0");
+          localDt = `${day}.${month}.${year} ${hours}:${minutes}:${seconds}`;
+        }
+        
+        // Build info window content
+        let content = `<div style="font-family: monospace; font-size: 12px;">`;
+        content += `<b>Seq:</b> ${p.seq}<br/>`;
+        content += `<b>Time (local):</b> ${localDt}<br/>`;
+        content += `<b>Time (UTC):</b> ${dt}<br/>`;
+        content += `<b>Channel:</b> ${p.ch}<br/>`;
+        if (p.net) content += `<b>Network:</b> ${p.net}<br/>`;
+        if (p.bat !== undefined) content += `<b>Battery:</b> ${p.bat}%<br/>`;
+        if (p.speed_kmh !== undefined) {
+          content += `<b>Speed:</b> ${p.speed_kmh} km/h (${p.speed_mps} m/s)<br/>`;
+        }
+        if (p.flags !== undefined) {
+          const flagBits = [
+            { bit: 0, name: "CHG", mask: 1 },
+            { bit: 1, name: "GPS", mask: 2 },
+            { bit: 2, name: "MOV", mask: 4 },
+            { bit: 3, name: "MSTART", mask: 8 },
+            { bit: 4, name: "MSTOP", mask: 16 },
+            { bit: 5, name: "HB", mask: 32 },
+            { bit: 6, name: "LOWBAT", mask: 64 },
+          ];
+          const flagStr = flagBits.filter(f => (p.flags & f.mask) !== 0).map(f => f.name).join(" ");
+          content += `<b>Flags (0x${p.flags.toString(16).padStart(2, "0")}):</b> ${flagStr || "none"}<br/>`;
+        }
+        content += `</div>`;
+        
+        const infoWindow = new google.maps.InfoWindow({ content });
+        
+        const m = new google.maps.Marker({
+          map,
+          position: { lat: p.lat, lng: p.lng },
+          title: `${p.ch} @ ${localDt}`
+        });
+        
+        m.addListener("click", () => {
+          // Close all other info windows (simplified: just open this one)
+          infoWindow.open(map, m);
+        });
+        
+        pointMarkers.push(m);
+        created++;
+      }
+      console.log("drawMarkers completed: created", created, "markers");
+    }
+
+    function drawSinglePolyline(path) {
+      if (!singleLine) {
+        singleLine = new google.maps.Polyline({
+          map,
+          path,
+          geodesic: true,
+          strokeColor: "#111111",
+          strokeOpacity: 0.9,
+          strokeWeight: 4,
+          strokeLinecap: "round",
+          strokeLinejoin: "round"
+        });
+      } else {
+        singleLine.setPath(path);
+        singleLine.setMap(map);
+      }
+    }
+
+    function drawChannelPolylines(pts) {
+      // Build paths preserving order, but split into wifi/lora paths.
+      const wifiPath = [];
+      const loraPath = [];
+      for (const p of pts) {
+        if (p.ch === "wifi") wifiPath.push({ lat: p.lat, lng: p.lng });
+        else if (p.ch === "lora") loraPath.push({ lat: p.lat, lng: p.lng });
+        else {
+          // unknown channel -> put into wifiPath by default (or ignore)
+          wifiPath.push({ lat: p.lat, lng: p.lng });
+        }
+      }
+
+      if (!wifiLine) {
+        wifiLine = new google.maps.Polyline({
+          map,
+          path: wifiPath,
+          geodesic: true,
+          strokeColor: "#0066FF", // wifi blue
+          strokeOpacity: 0.9,
+          strokeWeight: 4,
+          strokeLinecap: "round",
+          strokeLinejoin: "round"
+        });
+      } else {
+        wifiLine.setPath(wifiPath);
+        wifiLine.setMap(map);
+      }
+
+      if (!loraLine) {
+        loraLine = new google.maps.Polyline({
+          map,
+          path: loraPath,
+          geodesic: true,
+          strokeColor: "#FF0000", // lora red
+          strokeOpacity: 0.9,
+          strokeWeight: 4,
+          strokeLinecap: "round",
+          strokeLinejoin: "round"
+        });
+      } else {
+        loraLine.setPath(loraPath);
+        loraLine.setMap(map);
+      }
+    }
+
+    async function determineDefaultWindow(device) {
+      setStatus("Fetching last available data (up to 7 days)…");
+
+      const nowTs = Math.floor(Date.now() / 1000);
+      const beginTs = nowTs - 168 * 3600;
+      const endTs = nowTs;
+
+      // we can fetch without points for speed
+      const gj = await fetchGeoJSON({ device, beginTs, endTs, wantPoints: false });
+      const path = extractLineString(gj);
+      if (path.length === 0) return null;
+
+      let toTs = endTs;
+      let fromTs = toTs - 1 * 3600;
+
+      const meta = gj.features?.[0]?.properties ?? {};
+      if (typeof meta.to_ts === "number") toTs = meta.to_ts;
+      if (typeof meta.from_ts === "number") {
+        const earliest = meta.from_ts;
+        fromTs = Math.max(toTs - 1 * 3600, earliest);
+      } else {
+        fromTs = toTs - 1 * 3600;
+      }
+
+      return { fromTs, toTs };
+    }
+
+    async function loadAndDraw({ device, startTs, endTs }) {
+      const btn = document.getElementById("loadBtn");
+      btn.disabled = true;
+
+      try {
+        if (endTs <= startTs) throw new Error("End must be after start.");
+
+        const showPoints = document.getElementById("showPoints").checked;
+        const colorByCh  = document.getElementById("colorByCh").checked;
+
+        // If we need markers or channel-coloring, we must ask server for points
+        const wantPoints = showPoints || colorByCh;
+
+        setStatus(`Loading track for '${device}'… (points=${wantPoints ? 1 : 0})`);
+        const gj = await fetchGeoJSON({ device, beginTs: startTs, endTs: endTs, wantPoints });
+
+        // DEBUG: Log raw GeoJSON to see what server returned
+        console.log("Raw GeoJSON features count:", gj.features?.length ?? 0);
+        const firstFeature = gj.features?.[0];
+        if (firstFeature?.geometry?.type === "LineString") {
+          console.log("LineString coordinates count:", firstFeature.geometry.coordinates?.length ?? 0);
+        }
+        const pointFeatures = gj.features?.filter(f => f?.geometry?.type === "Point") ?? [];
+        console.log("Point features count:", pointFeatures.length);
+
+        clearAllRender();
+
+        let boundsPath = [];
+
+        if (wantPoints) {
+          const pts = extractPointFeatures(gj);
+          if (pts.length === 0) {
+            setStatus("No coordinates found in that interval.");
+            return;
+          }
+
+          boundsPath = pts.map(p => ({ lat: p.lat, lng: p.lng }));
+
+          if (colorByCh) {
+            drawChannelPolylines(pts);
+          } else {
+            // single line from point sequence
+            drawSinglePolyline(boundsPath);
+          }
+
+          if (showPoints) drawMarkers(pts);
+
+          map.fitBounds(computeBounds(boundsPath));
+
+          const wifiCount = pts.filter(p => p.ch === "wifi").length;
+          const loraCount = pts.filter(p => p.ch === "lora").length;
+          setStatus(`Loaded ${pts.length} points (wifi=${wifiCount}, lora=${loraCount}).`);
+
+        } else {
+          // fast: only LineString
+          const path = extractLineString(gj);
+          if (path.length === 0) {
+            setStatus("No coordinates found in that interval.");
+            return;
+          }
+
+          drawSinglePolyline(path);
+          map.fitBounds(computeBounds(path));
+
+          const meta = gj.features?.[0]?.properties ?? {};
+          setStatus(`Loaded ${path.length} coords (LineString). Window: from_ts=${meta.from_ts ?? "?"} to_ts=${meta.to_ts ?? "?"}`);
+        }
+
+      } catch (e) {
+        console.error(e);
+        setStatus("Error: " + (e && e.message ? e.message : String(e)));
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function init() {
+      while (!(window.google && google.maps)) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: { lat: 52.52, lng: 13.405 },
+        zoom: 11,
+        mapTypeId: "roadmap"
+      });
+
+      const deviceInput = document.getElementById("device");
+      const startInput = document.getElementById("start");
+      const endInput = document.getElementById("end");
+      const loadBtn = document.getElementById("loadBtn");
+      const refreshBtn = document.getElementById("refreshBtn");
+      const last24Btn = document.getElementById("last24Btn");
+      const last1hBtn = document.getElementById("last1hBtn");
+      const last15Btn = document.getElementById("last15Btn");
+      const topbar = document.getElementById("topbar");
+      const topbarToggle = document.getElementById("topbarToggle");
+
+      // Set default times immediately (always works, doesn't depend on PHP)
+      const now = new Date();
+      const start = new Date(now.getTime() - 24*3600*1000);  // Last 24h
+      endInput.value = toDatetimeLocalValue(now);
+      startInput.value = toDatetimeLocalValue(start);
+      setStatus("Ready. Choose dates and click 'Load track' or use quick-load buttons.");
+
+      // Set up event listeners FIRST before trying any async operations
+      topbarToggle.addEventListener("click", () => {
+        const collapsed = topbar.classList.toggle("collapsed");
+        topbarToggle.textContent = collapsed ? "▸" : "▾";
+        topbarToggle.setAttribute("aria-expanded", String(!collapsed));
+        topbarToggle.setAttribute("aria-label", collapsed ? "Expand controls" : "Collapse controls");
+      });
+
+      loadBtn.addEventListener("click", async () => {
+        const device = deviceInput.value.trim() || "default";
+        const startTs = parseDatetimeLocalToEpochSeconds(startInput.value);
+        const endTs = parseDatetimeLocalToEpochSeconds(endInput.value);
+        if (startTs == null || endTs == null) {
+          setStatus("Please choose valid start/end times.");
+          return;
+        }
+        await loadAndDraw({ device, startTs, endTs });
+      });
+
+      refreshBtn.addEventListener("click", async () => {
+        const device = deviceInput.value.trim() || "default";
+        const startTs = parseDatetimeLocalToEpochSeconds(startInput.value);
+        const endTs = parseDatetimeLocalToEpochSeconds(endInput.value);
+        if (startTs == null || endTs == null) {
+          setStatus("Please choose valid start/end times.");
+          return;
+        }
+        setStatus("Force-refreshing data (no cache)…");
+        await loadAndDraw({ device, startTs, endTs });
+      });
+
+      async function loadQuickRange(seconds) {
+        const device = deviceInput.value.trim() || "default";
+        
+        // Get current UTC time (epoch seconds)
+        const nowUtc = Math.floor(Date.now() / 1000);
+        let startUtc = nowUtc - seconds;
+        let endUtc = nowUtc;
+        
+        // Extend window slightly past current moment to ensure we capture data from "today"
+        // Add 1 hour to account for data generation after current time but before next query
+        endUtc = nowUtc + 3600;
+        
+        // Convert epoch seconds back to local Date for display
+        const nowDate = new Date(nowUtc * 1000);
+        const startDate = new Date(startUtc * 1000);
+
+        endInput.value = toDatetimeLocalValue(nowDate);
+        startInput.value = toDatetimeLocalValue(startDate);
+
+        await loadAndDraw({
+          device,
+          startTs: startUtc,
+          endTs: endUtc
+        });
+      }
+
+      last24Btn.addEventListener("click", () => loadQuickRange(24 * 3600));
+      last1hBtn.addEventListener("click", () => loadQuickRange(1 * 3600));
+      last15Btn.addEventListener("click", () => loadQuickRange(15 * 60));
+
+      // Reload automatically when options change (nice UX)
+      document.getElementById("showPoints").addEventListener("change", () => loadBtn.click());
+      document.getElementById("colorByCh").addEventListener("change", () => loadBtn.click());
+    }
+
+    init();
+  </script>
+</body>
+</html>

@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GPS Track Viewer</title>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #topbar {
+      display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;
+      padding: 10px 12px; border-bottom: 1px solid #ddd; background: #fafafa;
+    }
+    #topbar.collapsed { padding: 6px 12px; }
+    #topbar.collapsed .field { display: none; }
+    #topbar.collapsed .topbar-toggle { display: inline-flex; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    label { font-size: 12px; color: #333; }
+    input, button {
+      font-size: 14px; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; background: #fff;
+    }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
+    #status { padding: 6px 12px; font-size: 13px; color: #333; }
+    #map { height: calc(100% - 98px); } /* topbar + status */
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+    .topbar-toggle {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      padding: 6px 0;
+      border-radius: 999px;
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    @media (max-width: 720px) {
+      .topbar-toggle { display: inline-flex; }
+    }
+  </style>
+</head>
+<body>
+  <div id="topbar">
+    <button id="topbarToggle" class="topbar-toggle" aria-expanded="true" aria-label="Collapse controls">▾</button>
+    <div class="field">
+      <label for="device">Device</label>
+      <input id="device" value="ESP32-GPS-001" />
+    </div>
+
+    <div class="field">
+      <label for="start">Start (local time)</label>
+      <input id="start" type="datetime-local" />
+    </div>
+
+    <div class="field">
+      <label for="end">End (local time)</label>
+      <input id="end" type="datetime-local" />
+    </div>
+
+    <div class="field">
+      <label>&nbsp;</label>
+      <button id="loadBtn">Load track</button>
+    </div>
+
+    <div class="field">
+      <label>&nbsp;</label>
+      <button id="last24Btn">Last 24h</button>
+    </div>
+  </div>
+
+  <div id="status" class="mono">Initializing…</div>
+  <div id="map"></div>
+
+  <!-- 
+  <script
+    src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY&v=weekly"
+    defer
+  ></script>  
+-->
+  <script
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCLHu9NLUvCXyrAvhFQY6ZN8ybrGAK5u84&v=weekly"
+    defer
+  ></script>
+
+  <script>
+    // ===================== CONFIG =====================
+    const GPS_GEOJSON_URL = "./gps_geojson.php";            // adjust if needed
+    const API_TOKEN = "CHANGE_ME_LONG_RANDOM_TOKEN";        // must match PHP
+    // ==================================================
+
+    let map, polyline;
+
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg;
+    }
+
+    function toDatetimeLocalValue(d) {
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function parseDatetimeLocalToEpochSeconds(value) {
+      const d = new Date(value); // local time
+      if (Number.isNaN(d.getTime())) return null;
+      return Math.floor(d.getTime() / 1000);
+    }
+
+    async function fetchGeoJSON({ device, beginTs, endTs }) {
+      const url = new URL(GPS_GEOJSON_URL, window.location.href);
+      url.searchParams.set("device", device);
+      url.searchParams.set("begin_ts", String(beginTs));
+      url.searchParams.set("end_ts", String(endTs));
+      // points=0 default -> best performance
+      url.searchParams.set("points", "1");
+
+      const res = await fetch(url.toString(), {
+        headers: { "X-API-Token": API_TOKEN, "X-Device-Id": device }
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}: ${text}`);
+      }
+      return await res.json();
+    }
+
+    function extractAllCoords(geojson) {
+      if (!geojson || !Array.isArray(geojson.features) || geojson.features.length === 0) return [];
+      const f0 = geojson.features[0];
+      if (!f0 || !f0.geometry) return [];
+
+      if (f0.geometry.type === "LineString") {
+        const coords = f0.geometry.coordinates || [];
+        return coords.map(([lon, lat]) => ({ lat, lng: lon }));
+      }
+
+      if (f0.geometry.type === "Point") {
+        const [lon, lat] = f0.geometry.coordinates || [];
+        if (typeof lat === "number" && typeof lon === "number") return [{ lat, lng: lon }];
+      }
+      return [];
+    }
+
+    function computeBounds(path) {
+      const bounds = new google.maps.LatLngBounds();
+      for (const p of path) bounds.extend(p);
+      return bounds;
+    }
+
+    async function determineDefaultWindow(device) {
+      // We want: end = last fix available; begin = max(end-24h, earliest within the last 7d window)
+      setStatus("Fetching last available data (up to 7 days)…");
+
+      const nowTs = Math.floor(Date.now() / 1000);
+      const beginTs = nowTs - 168 * 3600;
+      const endTs = nowTs;
+
+      const gj = await fetchGeoJSON({ device, beginTs, endTs });
+      const path = extractAllCoords(gj);
+      if (path.length === 0) return null;
+
+      // Use server metadata if available
+      let toTs = endTs;
+      let fromTs = toTs - 24 * 3600;
+
+      const meta = gj.features?.[0]?.properties ?? {};
+      if (typeof meta.to_ts === "number") toTs = meta.to_ts;
+      if (typeof meta.from_ts === "number") {
+        const earliest = meta.from_ts;
+        fromTs = Math.max(toTs - 24 * 3600, earliest);
+      } else {
+        fromTs = toTs - 24 * 3600;
+      }
+
+      return { fromTs, toTs };
+    }
+
+    async function loadAndDraw({ device, startTs, endTs }) {
+      const btn = document.getElementById("loadBtn");
+      btn.disabled = true;
+
+      try {
+        if (endTs <= startTs) throw new Error("End must be after start.");
+
+        setStatus(`Loading track for '${device}'…`);
+        const gj = await fetchGeoJSON({ device, beginTs: startTs, endTs: endTs });
+        const path = extractAllCoords(gj);
+
+        if (path.length === 0) {
+          setStatus("No coordinates found in that interval.");
+          if (polyline) polyline.setPath([]);
+          return;
+        }
+
+        if (!polyline) {
+          polyline = new google.maps.Polyline({
+            map,
+            path,
+            geodesic: true,
+            strokeOpacity: 0.9,
+            strokeWeight: 4, 
+            strokeColor: "red", //"#0066FF",
+          });
+        } else {
+          polyline.setPath(path);
+        }
+
+        map.fitBounds(computeBounds(path));
+
+        const meta = gj.features?.[0]?.properties ?? {};
+        setStatus(`Loaded ${path.length} points. Window: from_ts=${meta.from_ts ?? "?"} to_ts=${meta.to_ts ?? "?"}`);
+
+      } catch (e) {
+        console.error(e);
+        setStatus("Error: " + (e && e.message ? e.message : String(e)));
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function init() {
+      while (!(window.google && google.maps)) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: { lat: 52.52, lng: 13.405 },
+        zoom: 11,
+        mapTypeId: "roadmap"
+      });
+
+      const deviceInput = document.getElementById("device");
+      const startInput = document.getElementById("start");
+      const endInput = document.getElementById("end");
+      const loadBtn = document.getElementById("loadBtn");
+      const last24Btn = document.getElementById("last24Btn");
+      const topbar = document.getElementById("topbar");
+      const topbarToggle = document.getElementById("topbarToggle");
+
+      const device = deviceInput.value.trim() || "default";
+
+      const def = await determineDefaultWindow(device);
+      if (!def) {
+        setStatus("No data available yet.");
+        const now = new Date();
+        const start = new Date(now.getTime() - 24*3600*1000);
+        endInput.value = toDatetimeLocalValue(now);
+        startInput.value = toDatetimeLocalValue(start);
+        return;
+      }
+
+      const endDate = new Date(def.toTs * 1000);
+      const startDate = new Date(def.fromTs * 1000);
+      endInput.value = toDatetimeLocalValue(endDate);
+      startInput.value = toDatetimeLocalValue(startDate);
+
+      await loadAndDraw({ device, startTs: def.fromTs, endTs: def.toTs });
+
+      topbarToggle.addEventListener("click", () => {
+        const collapsed = topbar.classList.toggle("collapsed");
+        topbarToggle.textContent = collapsed ? "▸" : "▾";
+        topbarToggle.setAttribute("aria-expanded", String(!collapsed));
+        topbarToggle.setAttribute("aria-label", collapsed ? "Expand controls" : "Collapse controls");
+      });
+
+      loadBtn.addEventListener("click", async () => {
+        const device = deviceInput.value.trim() || "default";
+        const startTs = parseDatetimeLocalToEpochSeconds(startInput.value);
+        const endTs = parseDatetimeLocalToEpochSeconds(endInput.value);
+        if (startTs == null || endTs == null) {
+          setStatus("Please choose valid start/end times.");
+          return;
+        }
+        await loadAndDraw({ device, startTs, endTs });
+      });
+
+      last24Btn.addEventListener("click", async () => {
+        const device = deviceInput.value.trim() || "default";
+        const now = new Date();
+        const start = new Date(now.getTime() - 24*3600*1000);
+
+        endInput.value = toDatetimeLocalValue(now);
+        startInput.value = toDatetimeLocalValue(start);
+
+        await loadAndDraw({
+          device,
+          startTs: Math.floor(start.getTime()/1000),
+          endTs: Math.floor(now.getTime()/1000)
+        });
+      });
+    }
+
+    init();
+  </script>
+</body>
+</html>

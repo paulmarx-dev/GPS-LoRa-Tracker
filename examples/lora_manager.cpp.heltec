@@ -1,0 +1,340 @@
+#include "lora_manager.h"
+#include "LoRaWan_APP.h"
+#include "Arduino.h"
+#include "track_storage.h"
+#include "wifi_manager.h"
+#include "gps.h"
+#include <math.h>
+
+// ================= ABP CREDENTIALS (stub for OTAA) =================
+// Heltec library requires these symbols for linking even though OTAA is enabled
+uint8_t nwkSKey[] = {0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85};
+uint8_t appSKey[] = {0xd7, 0x2c, 0x78, 0x75, 0x8c, 0xdc, 0xca, 0xbf, 0x55, 0xee, 0x4a, 0x77, 0x8d, 0x16, 0xef, 0x67};
+uint32_t devAddr = (uint32_t)0x007e6ae1;
+
+// ================= LoRaWAN CONFIG =================
+/* OTAA para*/ 
+uint8_t devEui[] = LORAWAN_DEVEUI;
+uint8_t appEui[] = LORAWAN_APPEUI;
+uint8_t appKey[] = LORAWAN_APPKEY;
+
+uint16_t userChannelsMask[6] = {0x00FF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
+uint32_t license[4] = LORAWAN_LICENSE;
+
+LoRaMacRegion_t loraWanRegion = LORAMAC_REGION_EU868;
+DeviceClass_t loraWanClass = CLASS_A;
+uint32_t appTxDutyCycle = 60000;  // 60 seconds iteration (LoRaWAN stack handles actual timing)
+bool overTheAirActivation = true;
+
+bool loraWanAdr = false;        // Adaptive Data Rate (ADR) should be disabled when mobile, see https://www.thethingsnetwork.org/forum/t/adr-for-mobile-devices/16978
+bool isTxConfirmed = false;     // Indicates if the node is sending confirmed or unconfirmed messages
+uint8_t appPort = 1;            // LoRaWAN application port used to send data (must not be 224, which is reserved for certification)
+uint8_t confirmedNbTrials = 4;  // Number of times the node will try to send the frame in case of a failed transmission (confirmed messages only), up to 8 (default: 4)
+
+// ================= MOVEMENT CONFIG =================
+static constexpr float MOVE_START_KMH = 2.0f;
+static constexpr float MOVE_STOP_KMH  = 1.0f;
+static constexpr float DIST_TRIGGER_M = 50.0f;
+
+// TEST ONLY: set to 1 to force heartbeat-only mode (disable movement/distance sends)
+#define TEST_LORA_HEARTBEAT 1
+// TEST ONLY: set to 1 to skip LoRaWAN.sleep() so tasks keep running
+#define TEST_LORA_NO_SLEEP 0
+
+static constexpr uint32_t HEARTBEAT_INTERVAL_S = 1 * 60;  // 1 minute
+static constexpr uint32_t MIN_SEND_INTERVAL_S  = 3 * 60;   // 3 minutes
+
+// ================= STATE MACHINE =================
+enum TxState {
+  TX_INIT,
+  TX_JOINED,
+  TX_READY,
+  TX_IDLE
+};
+
+static TxState txState = TX_INIT;
+static uint32_t lastSendMs = 0;
+static uint32_t lastHeartbeatMs = 0;
+static int32_t lastLatE7 = 0;
+static int32_t lastLonE7 = 0;
+static bool moving = false;
+static bool prevMoving = false;
+static RTC_DATA_ATTR uint32_t bootCount = 0;
+static bool joinInitiated = false;  // Track if we've sent join request
+
+static bool isNetworkJoined() {
+  MibRequestConfirm_t mibReq;
+  mibReq.Type = MIB_NETWORK_JOINED;
+  if (LoRaMacMibGetRequestConfirm(&mibReq) != LORAMAC_STATUS_OK) {
+    return false;
+  }
+  return mibReq.Param.IsNetworkJoined == true;
+}
+
+// ================= DISTANCE CALCULATION =================
+static float distanceMeters(int32_t lat1E7, int32_t lon1E7,
+                            int32_t lat2E7, int32_t lon2E7)
+{
+    const float R = 6371000.0f;
+
+    float lat1 = lat1E7 / 1e7f * DEG_TO_RAD;
+    float lat2 = lat2E7 / 1e7f * DEG_TO_RAD;
+    float dLat = lat2 - lat1;
+    float dLon = (lon2E7 - lon1E7) / 1e7f * DEG_TO_RAD;
+
+    float a = sin(dLat/2)*sin(dLat/2) +
+              cos(lat1)*cos(lat2) *
+              sin(dLon/2)*sin(dLon/2);
+
+    return 2 * R * atan2(sqrt(a), sqrt(1-a));
+}
+
+// ================= SEND PACKET =================
+static void sendPosition(int32_t latE7, int32_t lonE7, uint8_t bat, uint8_t flags)
+{
+    // 14-byte payload: ts(4) + latE7(4) + lonE7(4) + bat(1) + flags(1)
+    uint32_t ts = millis() / 1000;  // Use uptime as timestamp for dummy data
+    
+    appDataSize = 14;
+    appData[0]  = (ts >> 24) & 0xFF;
+    appData[1]  = (ts >> 16) & 0xFF;    
+    appData[2]  = (ts >> 8) & 0xFF;
+    appData[3]  = ts & 0xFF;
+
+    uint32_t ulat = static_cast<uint32_t>(latE7);
+    uint32_t ulon = static_cast<uint32_t>(lonE7);
+
+    appData[4]  = (ulat >> 24) & 0xFF;
+    appData[5]  = (ulat >> 16) & 0xFF;
+    appData[6]  = (ulat >> 8) & 0xFF;
+    appData[7]  = ulat & 0xFF;
+
+    appData[8]  = (ulon >> 24) & 0xFF;
+    appData[9]  = (ulon >> 16) & 0xFF;
+    appData[10] = (ulon >> 8) & 0xFF;
+    appData[11] = ulon & 0xFF;
+
+    appData[12] = bat;
+    appData[13] = flags;
+
+    Serial.printf("LoRa TX: lat=%.5f, lon=%.5f, bat=%u%%, flags=0x%02x\n",
+                  latE7 / 1e7f, lonE7 / 1e7f, bat, flags);
+
+    LoRaWAN.send();
+}
+
+// ================= MAIN UPDATE =================
+void loraInit() {
+  Serial.println("LoRa: initializing state machine");
+  txState = TX_INIT;
+  bootCount++;
+}
+
+void loraUpdate() {
+  switch (deviceState) {
+    case DEVICE_STATE_INIT: {
+      Serial.println(">> DEVICE_STATE_INIT");
+      LoRaWAN.init(loraWanClass, loraWanRegion);
+      LoRaWAN.setDefaultDR(3);
+      break;
+    }
+    case DEVICE_STATE_JOIN: {
+      //if (!joinInitiated) {
+        Serial.println(">> DEVICE_STATE_JOIN - sending join request");
+        LoRaWAN.join();  // Transmit join-request (should be non-blocking)
+        joinInitiated = true;
+        Serial.println("   Join request sent, waiting for response...");
+      //}
+      // LoRaWAN.sleep() below will service the radio and process join response
+      break;
+    }
+    case DEVICE_STATE_SEND: {
+      Serial.println(">> DEVICE_STATE_SEND");
+      // App logic decides when to send
+      break;
+    }
+    case DEVICE_STATE_CYCLE: {
+      Serial.println(">> DEVICE_STATE_CYCLE");
+      txDutyCycleTime = appTxDutyCycle;
+      LoRaWAN.cycle(txDutyCycleTime);
+      deviceState = DEVICE_STATE_SLEEP;
+      break;
+    }
+    case DEVICE_STATE_SLEEP: {
+      Serial.println(">> DEVICE_STATE_SLEEP");
+    #if TEST_LORA_NO_SLEEP
+      // TEST ONLY: skip sleep to keep logs/tasks running
+    #else
+      LoRaWAN.sleep(loraWanClass);
+    #endif
+      break;
+    }
+    default:
+      Serial.printf(">> DEVICE_STATE_UNKNOWN: %d\n", deviceState);
+      break;
+  }
+
+  if (wifiConnected) { return; } // Only send via LoRa if WiFi is unavailable
+
+  // ========== STATE MACHINE ==========
+  switch (txState) {
+    
+    case TX_INIT: {
+      Serial.println(">> TX_INIT");
+      txState = TX_JOINED;
+      break;
+    }
+
+    case TX_JOINED: {
+      Serial.println(">> TX_JOINED - checking isNetworkJoined...");
+      bool joined = isNetworkJoined();
+      Serial.printf("   isNetworkJoined() = %d\n", joined);
+      if (joined) {
+        Serial.println(">> TX_JOINED -> TX_READY (join successful!)");
+        txState = TX_READY;
+      }
+      break;
+    }
+
+    case TX_READY: {
+      Serial.println(">> TX_READY");
+      
+      // TEST ONLY: Use dummy GPS data for indoor testing
+      FixRec latest;
+      latest.ts = millis() / 1000;  // Current uptime in seconds
+      latest.latE7 = 523810000;     // 52.381° (Hannover)
+      latest.lonE7 = 97250000;      // 9.725°
+      latest.bat = 99;
+      latest.flags = 0x02;
+      
+      /* PRODUCTION: Uncomment this block and remove dummy data above
+      if (!trackStoreGetLatest(latest)) {
+        if (deviceState == DEVICE_STATE_SEND) {
+          deviceState = DEVICE_STATE_CYCLE;
+        }
+        break;
+      }
+
+      if (latest.ts == 0 || latest.ts < 946684800UL) { break; }
+      if (latest.latE7 < -900000000 || latest.latE7 > 900000000) { break; }
+      if (latest.lonE7 < -1800000000 || latest.lonE7 > 1800000000) { break; }
+      */
+
+      uint32_t nowMs = millis();
+      int32_t latE7 = latest.latE7;
+      int32_t lonE7 = latest.lonE7;
+      float speedKmh = GPS.speed.isValid() ? GPS.speed.kmph() : 0.0f;
+
+      // Movement detection
+      if (!moving && speedKmh > MOVE_START_KMH) {
+        moving = true;
+        Serial.println("LoRa: Movement STARTED");
+      }
+      if (moving && speedKmh <= MOVE_STOP_KMH) {
+        moving = false;
+        Serial.println("LoRa: Movement STOPPED");
+      }
+
+      const bool movementChanged = (moving != prevMoving);
+      bool reasonDistance = false;
+      const uint32_t heartbeatIntervalMs = HEARTBEAT_INTERVAL_S * 1000U;
+      const uint32_t minSendIntervalMs = MIN_SEND_INTERVAL_S * 1000U;
+      const bool heartbeatDue = (nowMs - lastHeartbeatMs) >= heartbeatIntervalMs;
+
+      // Distance trigger
+      if (moving && lastLatE7 != 0) {
+        float dist = distanceMeters(lastLatE7, lastLonE7, latE7, lonE7);
+        if (dist > DIST_TRIGGER_M) {
+          reasonDistance = true;
+          Serial.printf("LoRa: Distance trigger (%.1f m)\n", dist);
+        }
+      }
+
+      if (heartbeatDue) {
+        lastHeartbeatMs = nowMs;
+        Serial.println("LoRa: Heartbeat");
+      }
+      if (movementChanged) {
+        Serial.printf("LoRa: Movement state change (%s)\n", moving ? "moving" : "stopped");
+      }
+
+    #if TEST_LORA_HEARTBEAT
+      // TEST ONLY: heartbeat-only mode (remove for production)
+      bool shouldSend = heartbeatDue;
+    #else
+      bool shouldSend = reasonDistance || heartbeatDue || movementChanged;
+    #endif
+
+      // Rate limiting
+      if ((nowMs - lastSendMs) < minSendIntervalMs) {
+        if (!heartbeatDue && !movementChanged) {
+          shouldSend = false;
+        }
+      }
+
+      if (shouldSend && deviceState == DEVICE_STATE_SEND) {
+        sendPosition(latE7, lonE7, latest.bat, latest.flags);
+        deviceState = DEVICE_STATE_CYCLE;
+        txState = TX_IDLE;
+        lastSendMs = nowMs;
+        lastLatE7 = latE7;
+        lastLonE7 = lonE7;
+        if (movementChanged) {
+          prevMoving = moving;
+        }
+      } else if (!shouldSend && deviceState == DEVICE_STATE_SEND) {
+        deviceState = DEVICE_STATE_CYCLE;
+      }
+      break;
+    }
+
+    case TX_IDLE: {
+      // Wait for LoRaWAN stack to complete send
+      if (deviceState == DEVICE_STATE_CYCLE || deviceState == DEVICE_STATE_SLEEP) {
+        txState = TX_READY;  // Ready for next send
+      }
+      break;
+    }
+  }
+  Serial.printf("loraUpdate: dev=%d tx=%d wifi=%d\n", deviceState, txState, wifiConnected);
+}
+
+bool loraIsIdle() {
+  return txState == TX_READY || txState == TX_IDLE;
+}
+
+
+static void saveDataAlternatively() {
+    unsigned char *puc;
+    float lat, lon, hour, minute, second, centisecond;
+
+    appDataSize = 0;
+    puc = (unsigned char *)(&lat);
+    appData[appDataSize++] = puc[0];
+    appData[appDataSize++] = puc[1];
+    appData[appDataSize++] = puc[2];
+    appData[appDataSize++] = puc[3];
+
+    puc = (unsigned char *)(&lon);
+    appData[appDataSize++] = puc[0];
+    appData[appDataSize++] = puc[1];
+    appData[appDataSize++] = puc[2];
+    appData[appDataSize++] = puc[3];
+
+    puc = (unsigned char *)(&hour);
+    appData[appDataSize++] = puc[0];
+    appData[appDataSize++] = puc[1];
+
+    puc = (unsigned char *)(&minute);
+    appData[appDataSize++] = puc[0];
+    appData[appDataSize++] = puc[1];
+
+    puc = (unsigned char *)(&second);
+    appData[appDataSize++] = puc[0];
+    appData[appDataSize++] = puc[1];
+
+    puc = (unsigned char *)(&centisecond);
+    appData[appDataSize++] = puc[0];
+    appData[appDataSize++] = puc[1];
+
+}

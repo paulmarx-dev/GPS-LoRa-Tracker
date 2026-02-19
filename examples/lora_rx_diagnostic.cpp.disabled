@@ -1,0 +1,151 @@
+/*
+ * Plain LoRa RX Diagnostic Sketch for Heltec WiFi LoRa 32 V4
+ * 
+ * Purpose: Test if the SX1262 RX chain works at all (without LoRaWAN layer)
+ * 
+ * If this receives packets: RX hardware works → problem is LoRaWAN/RadioLib
+ * If this times out: RX hardware broken → antenna/TCXO/SX1262 issue
+ * 
+ * Settings: 868.1 MHz, SF9, BW125 kHz (matches TTN RX1 expectations)
+ */
+
+#include <RadioLib.h>
+#include "Arduino.h"
+
+// SX1262 pin definitions (Heltec V4)
+#define RADIO_SCLK_PIN 9
+#define RADIO_MISO_PIN 11
+#define RADIO_MOSI_PIN 10
+#define RADIO_CS_PIN 8
+#define RADIO_RST_PIN 12
+#define RADIO_DIO1_PIN 14
+#define RADIO_BUSY_PIN 13
+
+// RadioLib radio instance
+SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+
+static unsigned long lastStatusMs = 0;
+static unsigned long rxPacketCount = 0;
+static unsigned long lastRxMs = 0;
+
+void loraRxDiagnosticInit() {
+  delay(100);
+  Serial.flush();
+  
+  Serial.println("\n\n========================================");
+  Serial.println("[DIAGNOSTIC] Plain LoRa RX Test Starting");
+  Serial.println("========================================");
+  
+  // Initialize SPI
+  Serial.println("[SX1262] Configuring SPI...");
+  SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN, RADIO_CS_PIN);
+  SPI.setFrequency(1000000);  // 1 MHz safe speed
+  Serial.println("[SX1262] SPI configured (1 MHz)");
+  
+  // Initialize radio - plain LoRa, not LoRaWAN
+  Serial.print("[SX1262] Initializing radio (868.1 MHz, SF9, BW125)... ");
+  Serial.flush();
+  
+  int state = radio.begin(868.1,      // frequency (MHz) - TTN RX1 frequency
+                         125.0,        // bandwidth (kHz)
+                         9,            // spreading factor (SF9 = DR3)
+                         7,            // coding rate
+                         0x34,         // syncWord (LoRa default)
+                         -17,          // power (dBm) - RX only, doesn't matter
+                         8,            // preamble length
+                         1.8,          // TCXO voltage (CRITICAL for V4)
+                         false);       // useRegulatorLDO
+  
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print("FAILED (code ");
+    Serial.print(state);
+    Serial.println(")");
+    Serial.println("[SX1262] Cannot proceed without radio!");
+    while (true) {
+      delay(1000);
+      Serial.println("[ERROR] Radio init failed - halted");
+    }
+  }
+  Serial.println("SUCCESS");
+  
+  // Configure RF switch for RX
+  Serial.print("[V4] Configuring DIO2 as RF switch... ");
+  radio.setDio2AsRfSwitch(true);
+  Serial.println("OK");
+  
+  // Set radio to receive mode
+  Serial.print("[SX1262] Starting RX mode... ");
+  state = radio.startReceive();
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("SUCCESS - listening for packets!");
+  } else {
+    Serial.print("FAILED (code ");
+    Serial.print(state);
+    Serial.println(")");
+  }
+  
+  Serial.println("\n[DIAGNOSTIC] Listening on 868.1 MHz, SF9, BW125...");
+  Serial.println("[DIAGNOSTIC] Waiting for incoming LoRa packets...");
+  Serial.println("========================================\n");
+  
+  lastStatusMs = millis();
+}
+
+void loraRxDiagnosticUpdate() {
+  unsigned long now = millis();
+  
+  // Check for received packet
+  uint8_t rxBuf[256];  // Buffer for received data
+  size_t rxLen = radio.getPacketLength();
+  
+  if (rxLen > 0) {
+    // Data available, try to read it
+    int state = radio.readData(rxBuf, rxLen);
+    
+    if (state == RADIOLIB_ERR_NONE) {
+      // Packet received successfully!
+      rxPacketCount++;
+      lastRxMs = now;
+      
+      Serial.println("\n========================================");
+      Serial.print("[RX SUCCESS] Packet #");
+      Serial.print(rxPacketCount);
+      Serial.print(" received at ");
+      Serial.print(now);
+      Serial.println(" ms");
+      Serial.print("[RX LENGTH] ");
+      Serial.print(rxLen);
+      Serial.println(" bytes");
+      
+      int rssi = radio.getRSSI();
+      float snr = radio.getSNR();
+      Serial.print("[RX INFO] RSSI: ");
+      Serial.print(rssi);
+      Serial.print(" dBm, SNR: ");
+      Serial.print(snr);
+      Serial.println(" dB");
+      Serial.println("========================================\n");
+      
+      // Continue listening
+      radio.startReceive();
+    } else {
+      // Error reading data
+      Serial.print("[RX ERROR] readData failed with code: ");
+      Serial.println(state);
+      radio.startReceive();
+    }
+  }
+  
+  // Status output every 10 seconds
+  if (now - lastStatusMs >= 10000) {
+    Serial.print("[STATUS] RX listening | packets_received=");
+    Serial.print(rxPacketCount);
+    if (rxPacketCount > 0) {
+      Serial.print(" | last_rx=");
+      Serial.print((now - lastRxMs) / 1000);
+      Serial.print("s ago");
+    }
+    Serial.println();
+    lastStatusMs = now;
+  }
+}
