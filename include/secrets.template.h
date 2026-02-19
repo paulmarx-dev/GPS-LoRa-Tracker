@@ -42,5 +42,11 @@
 // Heltec LoRa License (required for Heltec devices)
 // Leave as-is for ESP32 devices, optional for other platforms
 #define LORAWAN_LICENSE {0x00000000, 0x00000000, 0x00000000, 0x00000000}
+// more infos on Heltec licenses
+// https://docs.heltec.org/general/how_to_use_license.html
+// Licensing website: https://resource.heltec.cn/search/
+// Get ChipID Code: https://github.com/HelTecAutomation/Heltec_ESP32/blob/master/examples/ESP32/GetChipID/GetChipID.ino
+
+
 
 #endif // SECRETS_H
