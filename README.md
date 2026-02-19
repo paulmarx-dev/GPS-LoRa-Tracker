@@ -215,7 +215,7 @@ Serial monitor shows:
 
 ### GPS won't acquire fix
 - Device needs outdoor line-of-sight
-- Cold fix takes 30-60 seconds first time
+- Cold fix takes 30-60 seconds first time (though depending on chip can last up to 15 minutes, this is normal for the first fix)
 - Warm fix typically 5-15 seconds after
 - Check TinyGPS++ serial output
 
