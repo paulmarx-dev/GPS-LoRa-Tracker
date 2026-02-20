@@ -253,11 +253,10 @@ void loraStop() {
 void loraResume() {
   if (!node || !isInitialized) { return; }
   
-  // Reset join state - radio will wake from sleep automatically on next transmission
-  hasJoined = false;  // Will rejoin on next loraUpdate
-  lastTxMs = millis();
+  // Reinitialize LoRa when leaving WiFi mode (fresh join attempt)
+  loraInit();
   
-  Serial.println("[LoRaWAN] Radio ready to resume (WiFi disconnected)");
+  Serial.println("[LoRaWAN] Radio reinitialized (WiFi disconnected)");
   Serial.flush();
 }
 
